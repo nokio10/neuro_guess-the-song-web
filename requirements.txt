@@ -1,0 +1,14 @@
+flask
+flask-socketio
+gunicorn
+eventlet
+psutil
+requests
+pydub
+yandex-music
+ollama
+audio-separator
+demucs
+# Закрепляем transformers, чтобы починить WhisperX
+# WhisperX в конце
+git+https://github.com/m-bain/whisperx.git
