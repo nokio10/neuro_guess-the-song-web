@@ -11,6 +11,7 @@ import warnings
 import queue
 import logging
 import ctypes
+import time
 import psutil
 from collections import Counter
 from flask import Flask, request, jsonify
@@ -117,8 +118,542 @@ def clean_lrc_lyrics(lrc_text):
     lines = [line.strip() for line in clean_text.split('\n') if line.strip()]
     return '\n'.join(lines)
 
+
+def parse_lrc_with_timestamps(lrc_text):
+    """
+    Парсит LRC текст, сохраняя таймкоды строк.
+    Возвращает список: [{"time_ms": 15500, "text": "Текст строки"}, ...]
+    """
+    if not lrc_text:
+        return []
+
+    lines = []
+    for raw_line in lrc_text.split('\n'):
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        # Ищем таймкод [MM:SS.xx]
+        m = re.match(r'\[(\d{2}):(\d{2})(?:\.(\d{2,3}))?\](.*)', raw_line)
+        if m:
+            minutes = int(m.group(1))
+            seconds = int(m.group(2))
+            millis_str = m.group(3) or "0"
+            # Нормализуем миллисекунды (2 цифры -> *10, 3 цифры -> как есть)
+            if len(millis_str) == 2:
+                millis = int(millis_str) * 10
+            else:
+                millis = int(millis_str)
+            time_ms = minutes * 60000 + seconds * 1000 + millis
+            text = m.group(4).strip()
+            if text:
+                lines.append({"time_ms": time_ms, "text": text})
+    return lines
+
+
+def extract_rhyme_words_from_lyrics(lyrics_text):
+    """
+    Извлекает последние слова каждой строки из официального текста.
+    Это гарантированно слова-рифмы.
+    Возвращает список: [{"word": "рекой", "line": "Бабки текут рекой", "line_idx": 3}, ...]
+    """
+    if not lyrics_text:
+        return []
+
+    results = []
+    lines = [l.strip() for l in lyrics_text.split('\n') if l.strip()]
+
+    for idx, line in enumerate(lines):
+        # Убираем пунктуацию в конце строки и берём последнее слово
+        words_in_line = re.findall(r'[а-яёА-ЯЁa-zA-Z]+', line)
+        if not words_in_line:
+            continue
+        last_word = words_in_line[-1].lower().replace('ё', 'е')
+        if len(last_word) >= 2:
+            results.append({
+                "word": last_word,
+                "line": line,
+                "line_idx": idx
+            })
+
+    return results
+
+
+def get_russian_syllable_tail(word, n=3):
+    """
+    Возвращает последние n символов, начиная с последней гласной.
+    Используется для фонетического сравнения рифм.
+    Пример: "рекой" -> "ой", "долине" -> "ине"
+    """
+    vowels = set('аеёиоуыэюя')
+    word = word.lower().replace('ё', 'е')
+    # Находим позицию последней гласной
+    last_vowel_pos = -1
+    for i in range(len(word) - 1, -1, -1):
+        if word[i] in vowels:
+            last_vowel_pos = i
+            break
+    if last_vowel_pos == -1:
+        return word[-n:]  # Нет гласных — берём хвост
+    # Берём от последней гласной до конца
+    tail = word[last_vowel_pos:]
+    # Если слишком короткий хвост, расширяем
+    if len(tail) < 2 and last_vowel_pos > 0:
+        # Ищем предпоследнюю гласную
+        for i in range(last_vowel_pos - 1, -1, -1):
+            if word[i] in vowels:
+                tail = word[i:]
+                break
+    return tail
+
+
+def score_lyrics_rhyme_candidates(rhyme_words, total_lines):
+    """
+    Алгоритмический скоринг кандидатов-рифм из официального текста.
+    Не использует LLM — чисто алгоритмический подход.
+
+    Возвращает отсортированный список: [(score, rhyme_word_entry), ...]
+    """
+    if not rhyme_words or total_lines == 0:
+        return []
+
+    # Подсчёт частотности
+    freq_map = Counter([rw["word"] for rw in rhyme_words])
+
+    scored = []
+    for rw in rhyme_words:
+        word = rw["word"]
+        line_idx = rw["line_idx"]
+        clean = clean_word(word)
+        score = 0
+
+        # --- Позиционный фильтр: 25-80% песни ---
+        progress = line_idx / total_lines
+        if progress < 0.25 or progress > 0.80:
+            continue
+
+        # --- Базовые фильтры ---
+        if len(clean) < 4:
+            continue
+        if clean in STOP_WORDS:
+            continue
+
+        # Проверка на гласные
+        vowels = set('аеиоуыэюя')
+        if not any(c in vowels for c in clean):
+            continue
+
+        # --- Скоринг ---
+
+        # Длина слова
+        if len(clean) >= 7:
+            score += 20
+        elif len(clean) >= 6:
+            score += SCORE_LONG_WORD_BONUS
+        elif len(clean) >= 5:
+            score += SCORE_MEDIUM_WORD_BONUS
+
+        # Уникальность (ключевой фактор — уникальные слова интереснее)
+        count = freq_map[word]
+        if count == 1:
+            score += SCORE_UNIQUE_WORD_BONUS + 10  # Усиленный бонус
+        elif count == 2:
+            score += SCORE_RARE_WORD_BONUS
+        elif count >= 4:
+            score += SCORE_FREQUENT_PENALTY  # Припев — скучно
+
+        # Штраф за банальные глагольные окончания
+        if clean.endswith(('ать', 'ить', 'ять', 'еть', 'ует', 'ает')):
+            score += SCORE_VERB_ENDING_PENALTY
+
+        # Бонус за существительные (эвристика по окончаниям)
+        if clean.endswith(('ость', 'ство', 'ение', 'ание')):
+            score += 5  # Абстрактные существительные — хорошие ответы
+
+        # Бонус за фонетическую "рифмопригодность"
+        # Проверяем, рифмуется ли с соседними строками
+        tail = get_russian_syllable_tail(clean)
+        rhyme_pairs = 0
+        for other_rw in rhyme_words:
+            if other_rw["line_idx"] != line_idx:
+                other_tail = get_russian_syllable_tail(other_rw["word"])
+                if tail == other_tail and len(tail) >= 2:
+                    rhyme_pairs += 1
+        if rhyme_pairs > 0:
+            score += 15  # Рифмуется с другой строкой — игрок сможет угадать!
+
+        scored.append((score, rw))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored
+
+
+def _levenshtein_ratio(s1, s2):
+    """Быстрое нечёткое сравнение двух строк (0.0 — разные, 1.0 — идентичны)."""
+    if not s1 or not s2:
+        return 0.0
+    if s1 == s2:
+        return 1.0
+    len1, len2 = len(s1), len(s2)
+    # Оптимизация: если длины сильно различаются — не совпадение
+    if abs(len1 - len2) > max(len1, len2) * 0.5:
+        return 0.0
+    # Простой Levenshtein через две строки матрицы
+    prev = list(range(len2 + 1))
+    for i in range(1, len1 + 1):
+        curr = [i] + [0] * len2
+        for j in range(1, len2 + 1):
+            cost = 0 if s1[i-1] == s2[j-1] else 1
+            curr[j] = min(curr[j-1] + 1, prev[j] + 1, prev[j-1] + cost)
+        prev = curr
+    distance = prev[len2]
+    max_len = max(len1, len2)
+    return 1.0 - distance / max_len
+
+
+def align_words_to_lyrics(all_words, official_lyrics):
+    """
+    Совмещает Whisper-слова (точные таймкоды, неточный текст) с official lyrics
+    (точный текст, нет таймкодов).
+
+    Алгоритм: проходим по строкам lyrics и по Whisper-словам параллельно.
+    Для каждого lyrics-слова ищем ближайшее Whisper-слово (по нечёткому сравнению
+    и позиции). Заменяем текст Whisper-слова на lyrics-слово, сохраняя таймкоды.
+
+    Результат: all_words с исправленным текстом + is_eol маркерами из lyrics.
+    """
+    if not all_words or not official_lyrics:
+        return all_words
+
+    # Разбиваем lyrics на строки → слова
+    lyrics_lines = [l.strip() for l in official_lyrics.split('\n') if l.strip()]
+    lyrics_flat = []  # [(clean_word, original_word, line_idx, is_last_in_line)]
+    for li, line in enumerate(lyrics_lines):
+        line_words = re.findall(r'[а-яёА-ЯЁa-zA-Z\-]+', line)
+        for wi, w in enumerate(line_words):
+            is_last = (wi == len(line_words) - 1)
+            lyrics_flat.append((clean_word(w), w, li, is_last))
+
+    if not lyrics_flat:
+        return all_words
+
+    log(f"🔗 Align: {len(all_words)} Whisper-слов ↔ {len(lyrics_flat)} lyrics-слов ({len(lyrics_lines)} строк)")
+
+    # --- Жадное сопоставление с нечётким сравнением ---
+    # Идём по lyrics_flat, для каждого слова ищем ближайший match в Whisper
+    # с ограничением: Whisper-индекс может только расти (монотонность)
+    whisper_idx = 0
+    matched_count = 0
+    pending_skipped = []  # Lyrics-слова которые Whisper пропустил (ещё не привязаны)
+    result_words = []  # Копия all_words с заменённым текстом
+
+    # Копируем all_words
+    for w in all_words:
+        result_words.append(dict(w))
+
+    for lyrics_idx, (lyr_clean, lyr_orig, line_idx, is_last_in_line) in enumerate(lyrics_flat):
+        if whisper_idx >= len(all_words):
+            break
+
+        # Ищем лучший match в окне [whisper_idx, whisper_idx + search_window]
+        # Окно шире для первых слов строки (может быть пропуск слов Whisper'ом)
+        search_window = 5
+        best_match_idx = -1
+        best_score = 0.0
+
+        for wi in range(whisper_idx, min(whisper_idx + search_window, len(all_words))):
+            w_clean = clean_word(all_words[wi]['word'])
+
+            # Точное совпадение — идеально
+            if w_clean == lyr_clean:
+                best_match_idx = wi
+                best_score = 1.0
+                break
+
+            # Нечёткое сравнение
+            ratio = _levenshtein_ratio(w_clean, lyr_clean)
+            # Порог: минимум 60% совпадения и длина слова >= 3
+            if ratio > best_score and ratio >= 0.55 and len(lyr_clean) >= 3:
+                best_match_idx = wi
+                best_score = ratio
+
+        if best_match_idx >= 0:
+            # Заменяем текст Whisper на lyrics
+            old_text = result_words[best_match_idx]['word']
+            result_words[best_match_idx]['word'] = lyr_orig
+            result_words[best_match_idx]['is_eol'] = is_last_in_line
+            result_words[best_match_idx]['lyrics_line_idx'] = line_idx
+            result_words[best_match_idx]['lyrics_line'] = lyrics_lines[line_idx]
+            # Сохраняем пропущенные lyrics-слова, которые Whisper не увидел
+            # (накопились между предыдущим match и этим)
+            if pending_skipped:
+                result_words[best_match_idx]['skipped_before'] = list(pending_skipped)
+                pending_skipped.clear()
+            if best_score < 1.0:
+                log(f"  🔄 '{old_text}' → '{lyr_orig}' (match={best_score:.0%})")
+            matched_count += 1
+            whisper_idx = best_match_idx + 1
+        else:
+            # Lyrics-слово не найдено в Whisper — запоминаем как пропущенное
+            pending_skipped.append(lyr_orig)
+
+    match_pct = matched_count / len(lyrics_flat) * 100 if lyrics_flat else 0
+    log(f"🔗 Align результат: {matched_count}/{len(lyrics_flat)} слов совмещено ({match_pct:.0f}%)")
+
+    # Если совмещение слишком плохое (<40%), не доверяем — вернём оригинал
+    if match_pct < 40:
+        log(f"⚠️ Align: слишком мало совпадений ({match_pct:.0f}%), используем оригинальный Whisper текст")
+        return all_words
+
+    return result_words
+
+
+def select_word_from_lyrics_algorithmically(official_lyrics, all_words):
+    """
+    Главная функция: алгоритмически выбирает слово-рифму из официального текста.
+    Затем находит его в массиве all_words (Whisper/alignment) для получения таймкодов.
+
+    Возвращает (target_idx, answer_line) — индекс в all_words и строку текста с ответом,
+    или (-1, "") если не удалось.
+    """
+    lines = [l.strip() for l in official_lyrics.split('\n') if l.strip()]
+    total_lines = len(lines)
+
+    if total_lines < 5:
+        return -1, ""
+
+    # 1. Извлекаем рифмы
+    rhyme_words = extract_rhyme_words_from_lyrics(official_lyrics)
+    if not rhyme_words:
+        return -1, ""
+
+    # 2. Скорим кандидатов
+    scored = score_lyrics_rhyme_candidates(rhyme_words, total_lines)
+    if not scored:
+        return -1, ""
+
+    # Логируем топ-5
+    top5 = [(s[1]["word"], s[0]) for s in scored[:5]]
+    log(f"📊 Топ-5 рифм (из текста): {top5}")
+
+    # 3. Пробуем найти каждого кандидата в all_words (с таймкодами)
+    for score_val, rw in scored[:10]:  # Проверяем топ-10
+        target_clean = clean_word(rw["word"])
+
+        # Ищем в all_words
+        for i, w in enumerate(all_words):
+            if clean_word(w['word']) == target_clean and w['start'] > MIN_AUDIO_POSITION:
+                # Проверяем, что слово в допустимой позиции (25-85% массива)
+                progress = i / len(all_words)
+                if not (0.25 <= progress <= 0.85):
+                    continue
+
+                # Таймкод не сжат (слово длится >0.15с)
+                word_dur = w['end'] - w['start']
+                if word_dur < 0.15:
+                    continue
+
+                # Таймкод не раздут (>5с на слово = баг alignment)
+                if word_dur > 5.0:
+                    continue
+
+                # Перекрытие с соседними словами (alignment сжат)
+                if i > 0 and w['start'] < all_words[i - 1]['end'] - 0.05:
+                    continue
+                if i + 1 < len(all_words) and w['end'] > all_words[i + 1]['start'] + 0.05:
+                    continue
+
+                # Нет большой паузы перед словом (проигрыш >5с)
+                if i > 0:
+                    gap = w['start'] - all_words[i - 1]['end']
+                    if gap > 5.0:
+                        continue
+
+                log(f"✅ [LYRICS_ALGO] Выбрано: '{rw['word']}' (score={score_val}, line: '{rw['line'][:40]}...')")
+                return i, rw["line"]
+
+    log("⚠️ Ни один кандидат из текста не найден в Whisper-массиве")
+    return -1, ""
+
+
+def select_word_from_lrc(raw_lrc, official_lyrics):
+    """
+    Выбирает слово-рифму используя LRC-таймкоды напрямую (без forced alignment).
+    LRC даёт точные таймкоды строк от Яндекс Музыки.
+
+    Возвращает dict: {"word", "line", "line_start_ms", "next_line_start_ms", "context"}
+    или None если не удалось.
+    """
+    lrc_lines = parse_lrc_with_timestamps(raw_lrc)
+    if len(lrc_lines) < 5:
+        return None
+
+    # Извлекаем рифмы и скорим
+    rhyme_words = extract_rhyme_words_from_lyrics(official_lyrics)
+    if not rhyme_words:
+        return None
+
+    scored = score_lyrics_rhyme_candidates(rhyme_words, len(lrc_lines))
+    if not scored:
+        return None
+
+    top5 = [(s[1]["word"], s[0]) for s in scored[:5]]
+    log(f"📊 Топ-5 рифм (из текста): {top5}")
+
+    # Для каждого кандидата ищем его строку в LRC
+    for score_val, rw in scored[:10]:
+        target_word = rw["word"]
+        target_line = rw["line"].strip().lower()
+        target_clean = clean_word(target_word)
+        target_line_idx = rw["line_idx"]
+
+        # Ищем строку в LRC-данных.
+        # Стратегия: ищем LRC-строку, которая заканчивается на target_word
+        # и находится в правильной позиции (25-85% трека).
+        # Если слово повторяется (припев), берём ту что ближе к середине.
+        candidates_lrc = []
+        for li, ll in enumerate(lrc_lines):
+            lrc_text = ll["text"].strip().lower()
+            lrc_words = re.findall(r'[а-яёА-ЯЁa-zA-Z]+', lrc_text)
+            if not lrc_words:
+                continue
+
+            lrc_last_word = clean_word(lrc_words[-1])
+
+            # Последнее слово LRC-строки = наш target
+            if lrc_last_word == target_clean:
+                candidates_lrc.append(li)
+            # Fallback: подстрочное сравнение
+            elif target_line in lrc_text or lrc_text in target_line:
+                candidates_lrc.append(li)
+
+        if not candidates_lrc:
+            continue
+
+        # Из кандидатов выбираем тот, что в правильном диапазоне (25-85%)
+        # и ближе к пропорциональной позиции target_line_idx
+        total_dur_ms_approx = lrc_lines[-1]["time_ms"] + 5000
+        best_lrc_idx = None
+        best_score = float('inf')
+        for li in candidates_lrc:
+            progress = lrc_lines[li]["time_ms"] / total_dur_ms_approx if total_dur_ms_approx > 0 else 0
+            if progress < 0.20 or progress > 0.88:
+                continue
+            if lrc_lines[li]["time_ms"] < MIN_AUDIO_POSITION * 1000:
+                continue
+            # Чем ближе к пропорциональной позиции — тем лучше
+            expected_progress = target_line_idx / max(1, len(lrc_lines))
+            dist = abs(progress - expected_progress)
+            if dist < best_score:
+                best_score = dist
+                best_lrc_idx = li
+
+        if best_lrc_idx is None:
+            continue
+
+        lrc_idx = best_lrc_idx
+        lrc_line = lrc_lines[lrc_idx]
+        line_start_ms = lrc_line["time_ms"]
+
+        # Таймкод следующей строки = конец текущей
+        if lrc_idx + 1 < len(lrc_lines):
+            next_line_start_ms = lrc_lines[lrc_idx + 1]["time_ms"]
+        else:
+            next_line_start_ms = line_start_ms + 5000
+
+        # Контекст: ТОЛЬКО предыдущие строки (БЕЗ строки с ответом!)
+        # Берём столько строк назад, чтобы контекст длился 20-30 сек
+        MIN_CONTEXT_DURATION = 20000  # 20 сек минимум
+        TARGET_CONTEXT_DURATION = 28000  # 28 сек цель
+
+        context_parts = []
+        context_start_idx = lrc_idx  # Будем двигать назад
+        for ci in range(lrc_idx - 1, -1, -1):
+            ctx_duration = line_start_ms - lrc_lines[ci]["time_ms"]
+            if ctx_duration > TARGET_CONTEXT_DURATION:
+                break
+            context_start_idx = ci
+            context_parts.insert(0, lrc_lines[ci]["text"].strip())
+
+        context = " ".join(context_parts)
+        context_start_ms = lrc_lines[context_start_idx]["time_ms"] if context_start_idx < lrc_idx else max(0, line_start_ms - TARGET_CONTEXT_DURATION)
+
+        # Проверяем что контекст не слишком короткий
+        context_duration = line_start_ms - context_start_ms
+        if context_duration < MIN_CONTEXT_DURATION and context_start_ms > 0:
+            context_start_ms = max(0, line_start_ms - MIN_CONTEXT_DURATION)
+
+        # Проверяем что контекст не пустой
+        if not context.strip():
+            continue
+
+        # Spoiler-проверка: слово-ответ не должно звучать в контексте
+        if target_clean in clean_word(context):
+            log(f"⚠️ [LRC_DIRECT] Spoiler: '{target_word}' найдено в контексте, пропуск")
+            continue
+
+        log(f"✅ [LRC_DIRECT] Выбрано: '{target_word}' (score={score_val}, "
+            f"line_start={line_start_ms}ms, next_line={next_line_start_ms}ms, "
+            f"context_start={context_start_ms}ms)")
+
+        return {
+            "word": target_word,
+            "line": rw["line"],
+            "line_start_ms": line_start_ms,
+            "next_line_start_ms": next_line_start_ms,
+            "context_start_ms": context_start_ms,
+            "context": context,
+            "score": score_val
+        }
+
+    log("⚠️ [LRC_DIRECT] Ни один кандидат не найден в LRC-строках")
+    return None
+
+
+def calculate_timings_from_lrc(lrc_result, audio_duration_ms):
+    """
+    Вычисляет тайминги для вопроса и ответа на основе LRC-таймкодов.
+
+    Ключевой момент: LRC даёт только начало СТРОКИ, а ответ — ПОСЛЕДНЕЕ СЛОВО строки.
+    Аудио вопроса должно включать ВСЮ строку ответа КРОМЕ последнего слова.
+    Оцениваем позицию последнего слова пропорционально: (N-1)/N * line_duration.
+    """
+    answer_line_start_ms = lrc_result["line_start_ms"]
+    next_line_ms = lrc_result["next_line_start_ms"]
+    context_start_ms = lrc_result.get("context_start_ms", max(0, answer_line_start_ms - 28000))
+    answer_line_text = lrc_result.get("line", "")
+
+    # Считаем слова в строке ответа
+    line_words = re.findall(r'[а-яёА-ЯЁa-zA-Z]+', answer_line_text)
+    n_words = max(len(line_words), 2)  # Минимум 2 слова
+
+    # Длительность строки ответа
+    line_duration_ms = next_line_ms - answer_line_start_ms
+    # Ограничиваем разумным пределом (строка не может быть >15с обычно)
+    line_duration_ms = min(line_duration_ms, 15000)
+
+    # Оценка позиции последнего слова: (N-1)/N * duration
+    # Минус 300мс буфер чтобы не зацепить начало последнего слова
+    estimated_answer_offset = int(line_duration_ms * (n_words - 1) / n_words) - 300
+    estimated_answer_offset = max(estimated_answer_offset, int(line_duration_ms * 0.5))  # минимум 50% строки
+
+    # q_end = начало строки + смещение до последнего слова
+    q_end_ms = answer_line_start_ms + estimated_answer_offset
+
+    # q_start = начало контекста
+    q_start_ms = context_start_ms
+
+    log(f"✂️ LRC cut: строка {n_words} слов, duration={line_duration_ms}ms, "
+        f"answer_offset={estimated_answer_offset}ms, q_end={q_end_ms}ms")
+
+    # Ответ: от 3с до q_end, до max 15с
+    a_start_ms = max(0, q_end_ms - 3000)
+    a_end_ms = min(audio_duration_ms, a_start_ms + 15000)
+
+    return (q_start_ms, q_end_ms), (a_start_ms, a_end_ms)
+
+
 STOP_WORDS = {
-    "и", "в", "во", "не", "на", "я", "с", "со", "он", "она", "оно", "они", 
+    "и", "в", "во", "не", "на", "я", "с", "со", "он", "она", "оно", "они",
     "а", "но", "к", "у", "по", "из", "за", "от", "о", "об", "для", "до", 
     "же", "ну", "вы", "мы", "ты", "бы", "ли", "или", "тут", "там", "где", 
     "как", "что", "кто", "это", "то", "так", "вот", "все", "всё", "уже", 
@@ -200,11 +735,15 @@ def task_worker():
             task_queue.task_done()
 
 
+_gen_start_time = 0.0  # Время старта текущей генерации
+
 def log(msg):
-    """Thread-safe логирование."""
+    """Thread-safe логирование с временной меткой."""
+    elapsed = time.time() - _gen_start_time if _gen_start_time > 0 else 0
+    timestamp = f"[{elapsed:6.1f}s]" if elapsed > 0 else "[     ]"
     with job_status_lock:
-        job_status["logs"].append(msg)
-    logger.info(msg)
+        job_status["logs"].append(f"{timestamp} {msg}")
+    logger.info(f"{timestamp} {msg}")
 
 # --- АУДИО УТИЛИТЫ ---
 
@@ -253,15 +792,81 @@ def preprocess_for_whisper(audio_path):
         log(f"⚠️ Ошибка DSP: {e}")
         return audio_path
 
+def preprocess_for_alignment(audio_path):
+    """
+    Облегчённая DSP обработка для forced alignment.
+    Forced alignment менее чувствителен к шумам, чем ASR,
+    поэтому достаточно базовой обработки.
+    """
+    try:
+        from pydub.effects import normalize
+
+        audio = AudioSegment.from_file(audio_path)
+        audio = audio.set_frame_rate(16000).set_channels(1)
+
+        # Мягкий high-pass (убираем только суб-бас)
+        audio = audio.high_pass_filter(80)
+        audio = normalize(audio)
+
+        output_path = os.path.splitext(audio_path)[0] + '_align.wav'
+        audio.export(output_path, format='wav')
+        log(f"🎵 DSP (alignment mode): лёгкая обработка")
+        return output_path
+
+    except Exception as e:
+        log(f"⚠️ Ошибка DSP alignment: {e}")
+        return audio_path
+
+
+_cached_separator = None
+
+def _get_separator(output_dir):
+    """Возвращает кэшированный Separator (модель загружается один раз)."""
+    global _cached_separator
+    if _cached_separator is not None:
+        # Обновляем output_dir для текущего трека
+        _cached_separator.output_dir = output_dir
+        return _cached_separator
+
+    from audio_separator.separator import Separator
+    # Заглушаем sub-логгеры audio-separator (иначе "Loading Roformer model..." на каждый вызов)
+    logging.getLogger("audio_separator").setLevel(logging.ERROR)
+    model_cache_dir = os.environ.get("MDX_MODEL_CACHE", "/app/mdx_cache")
+
+    _cached_separator = Separator(
+        log_level=logging.ERROR,
+        output_dir=output_dir,
+        output_format="wav",
+        model_file_dir=model_cache_dir,
+        output_single_stem="Vocals",
+        mdxc_params={"batch_size": 8}
+    )
+    _cached_separator.load_model(
+        model_filename='model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt'
+    )
+    return _cached_separator
+
+def release_separator():
+    """Освобождает кэшированный Separator (вызывать после генерации всех треков)."""
+    global _cached_separator
+    if _cached_separator is not None:
+        del _cached_separator
+        _cached_separator = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        log("🗑️ Separator освобождён из памяти")
+
 def isolate_vocals(audio_path, use_cache=True):
     """
     Изолирует вокал с помощью MDX-Net (audio-separator).
     ОПТИМИЗИРОВАНО ДЛЯ CPU: Генерирует только стем вокала.
+    Модель Roformer кэшируется между треками.
     """
     output_dir = os.path.dirname(audio_path)
     filename = os.path.basename(audio_path)
     file_id = os.path.splitext(filename)[0]
-    
+
     # Ожидаемый путь к файлу вокала
     expected_vocals_path = os.path.join(output_dir, f"{file_id}_vocals.wav")
 
@@ -272,43 +877,21 @@ def isolate_vocals(audio_path, use_cache=True):
     log(f"🎸 Запуск MDX-Net (CPU) для {filename}...")
 
     try:
-        from audio_separator.separator import Separator
-        
-        # Инициализация
-        # model_file_dir - папка для кэширования моделей (монтируется в docker-compose)
-        model_cache_dir = os.environ.get("MDX_MODEL_CACHE", "/app/mdx_cache")
-
-        separator = Separator(
-            log_level=logging.ERROR,
-            output_dir=output_dir,
-            output_format="wav",
-            model_file_dir=model_cache_dir,  # Кэш моделей
-            # ВАЖНО ДЛЯ CPU: Генерируем ТОЛЬКО вокал, чтобы не тратить ресурсы на инструментал
-            output_single_stem="Vocals",
-            # Roformer использует MDXC архитектуру — batch_size для 8845HS + 29GB RAM
-            mdxc_params={"batch_size": 4}
-        )
-
-        # Mel-Band Roformer — SOTA архитектура 2025-2026
-        # Даёт естественный тембр голоса (лучше для Whisper, чем MDX)
-        # Альтернатива: model_bs_roformer_ep_317_sdr_12.9755.ckpt (агрессивнее, но суше)
-        separator.load_model(
-            model_filename='model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt'
-        )
+        separator = _get_separator(output_dir)
 
         # Запуск разделения
         output_files = separator.separate(audio_path)
-        
+
         # Переименование результата в стандартное имя
         generated_file = None
         if output_files and len(output_files) > 0:
             generated_file = os.path.join(output_dir, output_files[0])
-            
+
         if generated_file and os.path.exists(generated_file):
             # Удаляем старый файл если был
             if os.path.exists(expected_vocals_path):
                 os.remove(expected_vocals_path)
-            
+
             os.rename(generated_file, expected_vocals_path)
             log(f"✅ Вокал MDX извлечен: {os.path.basename(expected_vocals_path)}")
             return expected_vocals_path
@@ -321,7 +904,54 @@ def isolate_vocals(audio_path, use_cache=True):
         # Если не вышло, пробуем вернуть оригинал, чтобы процесс не упал
         return audio_path
 
+def _select_word_llm_flow(words, generation_stats):
+    """
+    Старый пайплайн выбора слова: LLM (3 попытки) → алгоритмический fallback.
+    Возвращает (target_idx, used_method).
+    """
+    target_idx = -1
+    used_method = "none"
+    blacklist = []
+
+    for attempt in range(3):
+        llm_data = get_quiz_data_llm(words, forbidden_words=blacklist)
+        validated_data, validation_error = validate_llm_response(llm_data, words)
+
+        if validation_error:
+            log(f"⚠️ Валидация LLM: {validation_error}")
+            generation_stats['llm_failed_validation'] += 1
+            if llm_data and 'hidden_answer' in llm_data:
+                blacklist.append(clean_word(llm_data['hidden_answer']))
+            continue
+
+        if validated_data:
+            ans_clean = clean_word(validated_data['hidden_answer'])
+            ctx_clean = clean_word(validated_data.get('context_snippet', ''))
+            found_idx = find_safest_occurrence_index(words, ans_clean, ctx_clean)
+
+            if found_idx != -1:
+                target_idx = found_idx
+                used_method = f"llm_try_{attempt+1}"
+                break
+            else:
+                log(f"⚠️ Спойлер защита: '{ans_clean}' слишком рано.")
+                blacklist.append(ans_clean)
+
+    if target_idx == -1:
+        log("⚠️ Fallback: Smart Algorithm.")
+        target_idx = get_algorithmic_choice(words)
+        used_method = "algo"
+        generation_stats['algo_fallback'] += 1
+    else:
+        generation_stats['llm_success'] += 1
+
+    return target_idx, used_method
+
+
 def generation_task(game_id, token, urls):
+    global _gen_start_time
+    _gen_start_time = time.time()
+
     with job_status_lock:
         job_status["is_busy"] = True
         job_status["progress"] = 0
@@ -332,11 +962,12 @@ def generation_task(game_id, token, urls):
     generation_stats = {
         'total_tracks': 0,
         'tracks_processed': 0,
+        'lyrics_algo_success': 0,    # Алгоритмический выбор рифмы из текста (Whisper таймкоды)
         'llm_success': 0,
         'llm_failed_validation': 0,
         'algo_fallback': 0,
         'skipped_short': 0,
-        'skipped_no_context': 0,  # Пропущены из-за короткого контекста
+        'skipped_no_context': 0,
         'questions_created': 0
     }
 
@@ -366,51 +997,89 @@ def generation_task(game_id, token, urls):
                 if match and client:
                     tid = match.group(1)
                     fpath = os.path.join(game_temp_folder, f"{tid}.mp3")
-                    
-                    if not os.path.exists(fpath): 
-                        client.tracks([tid])[0].download(fpath)
+
+                    if not os.path.exists(fpath):
+                        for attempt in range(3):
+                            try:
+                                client.tracks([tid])[0].download(fpath)
+                                break
+                            except Exception as dl_e:
+                                if attempt < 2:
+                                    log(f"⚠️ Попытка {attempt+1}/3 не удалась для {tid}: {dl_e}. Повтор через {2 ** attempt}с...")
+                                    time.sleep(2 ** attempt)
+                                else:
+                                    raise dl_e
                     downloaded.append(fpath)
                     
                     # --- ПОЛУЧАЕМ ИНФОРМАЦИЮ О ТРЕКЕ ---
                     try:
-                        track_info = client.tracks([tid])[0]
+                        track_info = None
+                        for attempt in range(3):
+                            try:
+                                track_info = client.tracks([tid])[0]
+                                break
+                            except Exception as ti_e:
+                                if attempt < 2:
+                                    log(f"⚠️ Метаданные {tid}: попытка {attempt+1}/3 — {ti_e}. Повтор через {2 ** attempt}с...")
+                                    time.sleep(2 ** attempt)
+                                else:
+                                    raise ti_e
                         artist = track_info.artists[0].name if track_info.artists else "Неизвестен"
                         title = track_info.title
                         
                         # 1. Пробуем достать официальный текст
                         lyrics = ""
+                        raw_lrc = ""  # Сырой LRC с таймкодами
+                        lyrics_source = "none"
+
                         # Способ 1: Новый API (get_lyrics + fetch_lyrics) — 2025-2026
-                        try:
-                            lyrics_obj = track_info.get_lyrics('LRC')
-                            if lyrics_obj:
-                                raw_lyrics = lyrics_obj.fetch_lyrics()
-                                lyrics = clean_lrc_lyrics(raw_lyrics)
-                                log(f"📜 Найден текст (LRC) для: {title}")
-                        except NotFoundError:
-                            pass  # Текст не найден в новом API
-                        except Exception:
-                            pass  # Другая ошибка — пробуем старый способ
+                        for attempt in range(3):
+                            try:
+                                lyrics_obj = track_info.get_lyrics('LRC')
+                                if lyrics_obj:
+                                    raw_lrc = lyrics_obj.fetch_lyrics()
+                                    lyrics = clean_lrc_lyrics(raw_lrc)
+                                    lyrics_source = "lrc"
+                                    log(f"📜 Найден текст (LRC) для: {title}")
+                                break  # Успех или текста нет — не повторяем
+                            except NotFoundError:
+                                break  # Текст не найден — повторять бессмысленно
+                            except Exception as lrc_e:
+                                if attempt < 2:
+                                    log(f"⚠️ LRC {tid}: попытка {attempt+1}/3 — {lrc_e}. Повтор через {2 ** attempt}с...")
+                                    time.sleep(2 ** attempt)
+                                else:
+                                    log(f"⚠️ LRC {tid}: все 3 попытки неудачны, пробуем supplement")
 
                         # Способ 2: Fallback на старый API (supplement)
                         if not lyrics:
-                            try:
-                                supp = track_info.get_supplement()
-                                if supp and supp.lyrics and supp.lyrics.full_lyrics:
-                                    lyrics = supp.lyrics.full_lyrics
-                                    log(f"📜 Найден текст (supplement) для: {title}")
-                            except Exception:
-                                pass  # Текст не найден — не критично
+                            for attempt in range(3):
+                                try:
+                                    supp = track_info.get_supplement()
+                                    if supp and supp.lyrics and supp.lyrics.full_lyrics:
+                                        lyrics = supp.lyrics.full_lyrics
+                                        lyrics_source = "supplement"
+                                        log(f"📜 Найден текст (supplement) для: {title}")
+                                    break
+                                except Exception as sup_e:
+                                    if attempt < 2:
+                                        log(f"⚠️ Supplement {tid}: попытка {attempt+1}/3 — {sup_e}. Повтор через {2 ** attempt}с...")
+                                        time.sleep(2 ** attempt)
+                                    else:
+                                        log(f"⚠️ Supplement {tid}: текст не получен после 3 попыток")
 
                         # Сохраняем всё в словарь
                         files_metadata[fpath] = {
                             "meta": f"{artist} - {title}",
-                            "lyrics": lyrics
+                            "lyrics": lyrics,
+                            "raw_lrc": raw_lrc,
+                            "lyrics_source": lyrics_source
                         }
                         
                         log(f"📥 Скачан: {tid} ({artist} - {title})")
                     except Exception as meta_e:
                         log(f"📥 Скачан: {tid} (без метаданных)")
-                        files_metadata[fpath] = {"meta": "", "lyrics": ""}
+                        files_metadata[fpath] = {"meta": "", "lyrics": "", "raw_lrc": "", "lyrics_source": "none"}
                         
             except Exception as e:
                 log(f"⚠️ Ошибка URL {url}: {e}")
@@ -440,66 +1109,58 @@ def generation_task(game_id, token, urls):
             except OSError:
                 pass  # Не критично — папки могут не существовать
 
-            # 1. MDX-Net
-            recognition_source = isolate_vocals(fpath)
-
-            # 2. DSP (Compressor)
-            recognition_source = preprocess_for_whisper(recognition_source)
-
             try:
                 # Достаем инфу
-                file_data = files_metadata.get(fpath, {"meta": "", "lyrics": ""})
-                
-                # 3. WhisperX с "Чит-кодом" (Lyrics Prompt)
+                file_data = files_metadata.get(fpath, {"meta": "", "lyrics": "", "raw_lrc": "", "lyrics_source": "none"})
+                has_lyrics = bool(file_data["lyrics"] and len(file_data["lyrics"]) > 50)
+                answer_line = ""  # Строка текста с ответом (для lyrics-режима)
+
+                # ===== ЕДИНЫЙ ПАЙПЛАЙН: MDX + Whisper ASR для ВСЕХ треков =====
+                # Whisper даёт точные пословные таймкоды на оригинальном аудио.
+                # Lyrics/LRC используются ТОЛЬКО для выбора слова (рифмы), НЕ для таймкодов.
+
+                # 1. MDX-Net: изолируем вокал
+                vocals_path = isolate_vocals(fpath)
+
+                # 2. DSP обработка для Whisper
+                recognition_source = preprocess_for_whisper(vocals_path)
+
+                # 3. WhisperX ASR — получаем точные пословные таймкоды
                 words = process_audio_with_whisperx(
-                    recognition_source, 
-                    device=device, 
+                    recognition_source,
+                    device=device,
                     song_meta=file_data["meta"],
-                    official_lyrics=file_data["lyrics"] # <--- Передаем текст!
+                    official_lyrics=file_data["lyrics"]  # Lyrics в prompt улучшают точность ASR
                 )
-                
+
                 if len(words) < 15:
-                    log("🚫 Мало слов. Пропуск.")
+                    log("🚫 Мало слов от Whisper. Пропуск.")
                     generation_stats['skipped_short'] += 1
                     continue
-                
-                target_idx = -1
-                used_method = "none"
-                blacklist = []
-                
-                # 4. LLM / Algo
-                for attempt in range(3):
-                    llm_data = get_quiz_data_llm(words, forbidden_words=blacklist)
-                    validated_data, validation_error = validate_llm_response(llm_data, words)
-                    
-                    if validation_error:
-                        log(f"⚠️ Валидация LLM: {validation_error}")
-                        generation_stats['llm_failed_validation'] += 1
-                        if llm_data and 'hidden_answer' in llm_data:
-                            blacklist.append(clean_word(llm_data['hidden_answer']))
-                        continue
 
-                    if validated_data:
-                        ans_clean = clean_word(validated_data['hidden_answer'])
-                        ctx_clean = clean_word(validated_data.get('context_snippet', ''))
-                        found_idx = find_safest_occurrence_index(words, ans_clean, ctx_clean)
+                # 4. ВЫБОР СЛОВА: lyrics → алгоритмический, без lyrics → LLM
+                if has_lyrics:
+                    log(f"📜 Режим: WHISPER + LYRICS ALGO (текст из {file_data['lyrics_source']})")
 
-                        if found_idx != -1:
-                            target_idx = found_idx
-                            used_method = f"llm_try_{attempt+1}"
-                            break
-                        else:
-                            log(f"⚠️ Спойлер защита: '{ans_clean}' слишком рано.")
-                            blacklist.append(ans_clean)
-                
-                if target_idx == -1:
-                    log("⚠️ Fallback: Smart Algorithm.")
-                    target_idx = get_algorithmic_choice(words)
-                    used_method = "algo"
-                    generation_stats['algo_fallback'] += 1
+                    # 4a. Совмещаем Whisper-таймкоды с точным текстом из lyrics
+                    words = align_words_to_lyrics(words, file_data["lyrics"])
+
+                    # 4b. Алгоритмический выбор рифмы из текста, таймкоды из Whisper
+                    target_idx, answer_line = select_word_from_lyrics_algorithmically(file_data["lyrics"], words)
+                    used_method = "lyrics_algo"
+
+                    if target_idx == -1:
+                        log("⚠️ Lyrics algo не нашёл кандидата, fallback на LLM...")
+                        target_idx, used_method = _select_word_llm_flow(words, generation_stats)
+                    else:
+                        generation_stats['lyrics_algo_success'] += 1
+
                 else:
-                    generation_stats['llm_success'] += 1
-                
+                    log(f"🎤 Режим: WHISPER + LLM (текст не найден)")
+
+                    # LLM / Algo выбор слова
+                    target_idx, used_method = _select_word_llm_flow(words, generation_stats)
+
                 if target_idx == -1 or target_idx is None:
                     log("❌ Не удалось выбрать слово.")
                     continue
@@ -523,7 +1184,7 @@ def generation_task(game_id, token, urls):
                             break  # Все варианты исчерпаны
 
                     tried_indices.add(target_idx)
-                    q_times, a_times = calculate_timings(words, target_idx)
+                    q_times, a_times = calculate_timings(words, target_idx, is_lyrics_mode=has_lyrics, answer_line=answer_line)
 
                     # Проверка 1: достаточная длительность контекста
                     if (q_times[1] - q_times[0]) < 20000:
@@ -535,7 +1196,30 @@ def generation_task(game_id, token, urls):
                         log(f"⚠️ Spoiler: '{words[target_idx]['word']}' звучит в аудио вопроса, пробуем другое... (попытка {timing_attempt + 1}/5)")
                         continue
 
-                    # Обе проверки пройдены
+                    # Проверка 3: пауза перед ответом не слишком большая (проигрыш)
+                    if target_idx > 0:
+                        gap_before = words[target_idx]['start'] - words[target_idx - 1]['end']
+                        if gap_before > 5.0:
+                            log(f"⚠️ Большая пауза ({gap_before:.1f}с) перед '{words[target_idx]['word']}', пробуем другое... (попытка {timing_attempt + 1}/5)")
+                            continue
+
+                    # Проверка 4: таймкоды не сжаты (слово должно длиться >0.15с)
+                    word_duration = words[target_idx]['end'] - words[target_idx]['start']
+                    if word_duration < 0.15:
+                        log(f"⚠️ Сжатый таймкод ({word_duration:.2f}с) для '{words[target_idx]['word']}', пробуем другое... (попытка {timing_attempt + 1}/5)")
+                        continue
+
+                    # Проверка 5: таймкод не раздут (>5с на одно слово = баг alignment)
+                    if word_duration > 5.0:
+                        log(f"⚠️ Раздутый таймкод ({word_duration:.1f}с) для '{words[target_idx]['word']}', пробуем другое... (попытка {timing_attempt + 1}/5)")
+                        continue
+
+                    # Проверка 6: нет перекрытия с соседними словами
+                    if target_idx > 0 and words[target_idx]['start'] < words[target_idx - 1]['end'] - 0.05:
+                        log(f"⚠️ Перекрытие с предыдущим словом для '{words[target_idx]['word']}', пробуем другое... (попытка {timing_attempt + 1}/5)")
+                        continue
+
+                    # Все проверки пройдены
                     final_target_idx = target_idx
                     break
 
@@ -548,15 +1232,27 @@ def generation_task(game_id, token, urls):
                 answer_word_obj = words[target_idx]
                 answer_text = re.sub(r'[^\w]', '', answer_word_obj['word'])
 
+                # --- DEBUG: таймкоды вокруг слова-ответа ---
+                dbg_start = max(0, target_idx - 5)
+                dbg_end = min(len(words), target_idx + 3)
+                dbg_lines = []
+                for di in range(dbg_start, dbg_end):
+                    w = words[di]
+                    marker = " <<<" if di == target_idx else ""
+                    dbg_lines.append(f"  [{di}] {w['start']:.2f}-{w['end']:.2f}s '{w['word']}'{marker}")
+                log(f"🔍 Таймкоды (q_end={q_times[1]}ms, a_start={a_times[0]}ms):\n" + "\n".join(dbg_lines))
+
                 audio = AudioSegment.from_mp3(fpath)
-                q_seg = audio[q_times[0]:q_times[1]].fade_out(150).fade_in(1500)
-                a_seg = audio[a_times[0]:a_times[1]].fade_in(100) 
+                orig_duration_ms = len(audio)
+                q_seg = audio[q_times[0]:q_times[1] - 100].fade_out(150).fade_in(1500)
+                a_seg = audio[a_times[0]:a_times[1]].fade_in(100)
+                log(f"🔍 Оригинал: {orig_duration_ms}ms, q=[{q_times[0]}-{q_times[1]}ms] ({len(q_seg)}ms), a=[{a_times[0]}-{a_times[1]}ms] ({len(a_seg)}ms)")
                 
                 qid = str(uuid.uuid4())[:8]
                 q_seg.export(os.path.join(game_media_folder, f"{qid}-1.mp3"), format="mp3")
                 a_seg.export(os.path.join(game_media_folder, f"{qid}-2.mp3"), format="mp3")
                 
-                context_str = build_context_string(words, target_idx)
+                context_str = build_context_string(words, target_idx, is_lyrics_mode=has_lyrics, answer_line=answer_line)
                 
                 new_qs.append({
                     "id": qid,
@@ -595,6 +1291,8 @@ def generation_task(game_id, token, urls):
         log(f"\n📊 Статистика генерации:")
         log(f"   Всего треков: {generation_stats['total_tracks']}")
         log(f"   Вопросов создано: {generation_stats['questions_created']}")
+        if generation_stats['lyrics_algo_success'] > 0:
+            log(f"   Lyrics Algo (Whisper + текст): {generation_stats['lyrics_algo_success']}")
         log(f"   LLM успех: {generation_stats['llm_success']}")
         log(f"   Algo fallback: {generation_stats['algo_fallback']}")
         if generation_stats['skipped_short'] > 0:
@@ -606,9 +1304,151 @@ def generation_task(game_id, token, urls):
         log(f"FATAL: {e}")
         logger.exception("Generation task failed")
     finally:
+        # Освобождаем кэшированную модель Separator
+        release_separator()
         with job_status_lock:
             job_status["is_busy"] = False
             job_status["status"] = "finished"
+
+def forced_align_lyrics(audio_path, official_lyrics, device="cpu", raw_lrc=""):
+    """
+    Forced alignment: вместо распознавания речи выравнивает ИЗВЕСТНЫЙ текст по аудио.
+    Слова гарантированно правильные (из Яндекс Музыки), нужны только таймкоды.
+
+    Если raw_lrc передан — используем LRC-таймкоды как точные якоря для сегментов.
+    Если нет — равномерное распределение (менее точно).
+    """
+    try:
+        log("🎯 Forced Alignment: используем официальный текст (без ASR)")
+
+        audio = whisperx.load_audio(audio_path)
+        audio_duration = len(audio) / 16000  # WhisperX загружает в 16kHz
+
+        fake_segments = []
+
+        # --- Вариант 1: Есть LRC с точными таймкодами от Яндекса ---
+        if raw_lrc:
+            lrc_lines = parse_lrc_with_timestamps(raw_lrc)
+            if lrc_lines:
+                log(f"🎯 Используем LRC-якоря ({len(lrc_lines)} строк с таймкодами)")
+                for i, lrc_line in enumerate(lrc_lines):
+                    clean_line = lrc_line["text"].strip()
+                    if not clean_line:
+                        continue
+                    if any(junk in clean_line.lower() for junk in JUNK_PHRASES):
+                        continue
+
+                    seg_start = lrc_line["time_ms"] / 1000.0
+                    # Конец сегмента = начало следующей строки
+                    if i + 1 < len(lrc_lines):
+                        seg_end = lrc_lines[i + 1]["time_ms"] / 1000.0
+                    else:
+                        seg_end = min(seg_start + 10.0, audio_duration)
+
+                    fake_segments.append({
+                        "text": clean_line,
+                        "start": seg_start,
+                        "end": seg_end
+                    })
+
+        # --- Вариант 2: Нет LRC — равномерное распределение (fallback) ---
+        if not fake_segments:
+            lines = [l.strip() for l in official_lyrics.split('\n') if l.strip()]
+            if not lines:
+                return []
+
+            log(f"🎯 LRC отсутствует, равномерное распределение ({len(lines)} строк)")
+            time_per_line = audio_duration / len(lines)
+            for i, line in enumerate(lines):
+                clean_line = line.strip()
+                if not clean_line:
+                    continue
+                if any(junk in clean_line.lower() for junk in JUNK_PHRASES):
+                    continue
+
+                seg_start = i * time_per_line
+                seg_end = (i + 1) * time_per_line
+                fake_segments.append({
+                    "text": clean_line,
+                    "start": seg_start,
+                    "end": seg_end
+                })
+
+        if not fake_segments:
+            return []
+
+        # 2. Загружаем модель выравнивания (wav2vec2-based, НЕ whisper)
+        log("🔄 Загрузка модели выравнивания...")
+        model_a, metadata = whisperx.load_align_model(
+            language_code="ru",
+            device=device
+        )
+
+        # 3. Выравниваем — получаем точные пословные таймкоды
+        try:
+            aligned_result = whisperx.align(
+                fake_segments,
+                model_a,
+                metadata,
+                audio,
+                device,
+                return_char_alignments=False
+            )
+        finally:
+            # Гарантированная очистка даже при ошибке alignment
+            del model_a, metadata
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
+            del audio
+            gc.collect()
+
+        # 4. Извлекаем слова с таймкодами
+        all_words = []
+        segments = aligned_result.get("segments", [])
+
+        for seg_idx, segment in enumerate(segments):
+            words_in_seg = segment.get("words", [])
+
+            if not words_in_seg:
+                continue
+
+            for i, word in enumerate(words_in_seg):
+                if "start" not in word or "end" not in word:
+                    continue
+
+                clean = clean_word(word["word"])
+                if not re.match(r'^[а-яё]+$', clean):
+                    continue
+                if len(clean) < 2:
+                    continue
+
+                # Определяем конец строки
+                is_end_of_line = (i == len(words_in_seg) - 1)
+                if not is_end_of_line and i < len(words_in_seg) - 1:
+                    next_word = words_in_seg[i + 1]
+                    if "start" in next_word:
+                        pause_after = next_word["start"] - word["end"]
+                        if pause_after > 0.3:
+                            is_end_of_line = True
+
+                w_obj = {
+                    "word": word["word"].strip(),
+                    "start": word["start"],
+                    "end": word["end"],
+                    "is_eol": is_end_of_line,
+                    "confidence": word.get("score", 0.9)
+                }
+                all_words.append(w_obj)
+
+        log(f"🎯 Forced Alignment: получено {len(all_words)} слов с таймкодами")
+        return all_words
+
+    except Exception as e:
+        log(f"⚠️ Forced Alignment failed: {e}")
+        traceback.print_exc()
+        return []
+
 
 def process_audio_with_whisperx(audio_path, device="cpu", song_meta="", official_lyrics=""):
     """
@@ -646,13 +1486,13 @@ def process_audio_with_whisperx(audio_path, device="cpu", song_meta="", official
             "best_of": 5,
             "patience": 2.0,
             "length_penalty": 1.0,
-            
-            # Параметры ASR
-            "log_prob_threshold": -1.0,   
-            "no_speech_threshold": 0.8,   
 
-            "initial_prompt": prompt, # <--- Самое важное здесь
-            "hallucination_silence_threshold": 2.0,
+            # Параметры ASR — оптимизированы для ПЕНИЯ (не речи!)
+            "log_prob_threshold": -1.0,
+            "no_speech_threshold": 0.4,    # Снижено с 0.8 — в пении голос часто похож на "не речь"
+
+            "initial_prompt": prompt,
+            "hallucination_silence_threshold": 4.0,  # Повышено с 2.0 — в песнях паузы между фразами >2с это норма
             "condition_on_previous_text": True,
             "suppress_blank": True,
             "word_timestamps": True
@@ -685,17 +1525,24 @@ def process_audio_with_whisperx(audio_path, device="cpu", song_meta="", official
         if device == "cuda": torch.cuda.empty_cache()
 
         log("Aligning audio...")
+        model_a = None
+        metadata_a = None
         try:
-            model_a, metadata = whisperx.load_align_model(language_code=result["language"], device=device)
-            aligned_result = whisperx.align(raw_segments, model_a, metadata, audio, device, return_char_alignments=False)
-            del model_a
-            gc.collect()
-            if device == "cuda": torch.cuda.empty_cache()
-
+            model_a, metadata_a = whisperx.load_align_model(language_code=result["language"], device=device)
+            aligned_result = whisperx.align(raw_segments, model_a, metadata_a, audio, device, return_char_alignments=False)
             segments_to_process = aligned_result["segments"]
         except Exception as e:
             log(f"⚠️ Ошибка Alignment: {e}. Используем сырые сегменты.")
             segments_to_process = raw_segments
+        finally:
+            # Гарантированная очистка модели и метаданных
+            if model_a is not None:
+                del model_a
+            if metadata_a is not None:
+                del metadata_a
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
 
         # Освобождаем аудио-буфер после завершения всех операций с ним
         del audio
@@ -756,6 +1603,16 @@ def process_audio_with_whisperx(audio_path, device="cpu", song_meta="", official
                 }
                 all_words.append(w_obj)
 
+        # --- ДЕБАГ: выводим распознанный текст ---
+        if all_words:
+            full_text_parts = []
+            for w in all_words:
+                full_text_parts.append(w['word'])
+                if w.get('is_eol'):
+                    full_text_parts.append('\n')
+            full_text = ' '.join(full_text_parts).replace(' \n ', '\n').replace(' \n', '\n')
+            log(f"📝 [WHISPER] Текст ({len(all_words)} слов):\n{full_text}")
+
         return all_words
     except Exception as e:
         log(f"WhisperX Error: {e}")
@@ -772,7 +1629,11 @@ def clean_word(w):
     return re.sub(r'[^\w]', '', w)
 
 def score_candidates(all_words, extended_range=False):
-    """Улучшенная алгоритмическая оценка слов с логированием."""
+    """Улучшенная алгоритмическая оценка слов с логированием.
+
+    Включает фонетический анализ рифм: если слово рифмуется с другим
+    концом строки — бонус (игрок сможет угадать по рифме).
+    """
     if not all_words:
         return []
 
@@ -784,6 +1645,14 @@ def score_candidates(all_words, extended_range=False):
     min_progress = 0.20 if extended_range else 0.30
     max_progress = 0.85 if extended_range else 0.70
     min_audio_pos = MIN_AUDIO_POSITION * 0.7 if extended_range else MIN_AUDIO_POSITION
+
+    # Собираем хвосты всех EOL-слов для проверки рифм
+    eol_tails = {}  # {индекс: хвост}
+    for i, w in enumerate(all_words):
+        if w.get('is_eol', False):
+            c = clean_word(w['word'])
+            if len(c) >= 3:
+                eol_tails[i] = get_russian_syllable_tail(c)
 
     for i, w_obj in enumerate(all_words):
         word = w_obj['word']
@@ -802,6 +1671,13 @@ def score_candidates(all_words, extended_range=False):
 
         # Временной фильтр
         if w_obj['start'] < min_audio_pos:
+            continue
+
+        # Валидация таймкодов (баги alignment)
+        word_dur = w_obj['end'] - w_obj['start']
+        if word_dur < 0.15 or word_dur > 5.0:
+            continue
+        if i > 0 and w_obj['start'] < all_words[i - 1]['end'] - 0.05:
             continue
 
         score = 0
@@ -832,6 +1708,25 @@ def score_candidates(all_words, extended_range=False):
         # Штраф за типичные глагольные окончания (менее интересны)
         if clean.endswith(('ать', 'ить', 'ять', 'еть', 'ение', 'ание')):
             score += SCORE_VERB_ENDING_PENALTY
+
+        # Бонус за фонетическую рифму с соседними EOL-словами
+        # Если слово рифмуется с другим концом строки — игрок может угадать!
+        if w_obj.get('is_eol', False) and len(clean) >= 3:
+            my_tail = get_russian_syllable_tail(clean)
+            if len(my_tail) >= 2:
+                for other_i, other_tail in eol_tails.items():
+                    if other_i != i and other_tail == my_tail:
+                        score += 15
+                        break  # Одного совпадения достаточно
+
+        # Штраф за большой gap перед словом (Whisper мог пропустить слова —
+        # контекст будет неполным, плохо для викторины)
+        if i > 0:
+            gap = w_obj['start'] - all_words[i - 1]['end']
+            if gap > 2.0:
+                score -= 30  # Сильный штраф — контекст будет с "..."
+            elif gap > 1.0:
+                score -= 10  # Лёгкий штраф
 
         scores.append((score, i, clean))
 
@@ -1233,26 +2128,66 @@ def check_spoiler_in_question(all_words, target_idx, q_start_ms, q_end_ms):
 
 # --- СБОРКА ---
 
-def calculate_timings(all_words, target_idx):
-    """Вычисляет тайминги для вопроса и ответа."""
+def _find_answer_line_start(all_words, target_idx, answer_line):
+    """Находит индекс первого слова строки ответа в all_words.
+
+    Ищет первое слово из answer_line в all_words, двигаясь назад от target_idx.
+    Возвращает индекс первого слова строки или -1 если не найдено.
+    """
+    if not answer_line:
+        return -1
+
+    # Извлекаем первое слово строки
+    line_words = re.findall(r'[а-яёА-ЯЁa-zA-Z]+', answer_line)
+    if not line_words:
+        return -1
+
+    first_word_clean = clean_word(line_words[0])
+    if len(first_word_clean) < 2:
+        # Первое слово слишком короткое (предлог) — берём второе
+        if len(line_words) > 1:
+            first_word_clean = clean_word(line_words[1])
+        else:
+            return -1
+
+    # Ищем назад от target_idx (не дальше 20 слов)
+    search_start = max(0, target_idx - 20)
+    for j in range(target_idx - 1, search_start - 1, -1):
+        if clean_word(all_words[j]['word']) == first_word_clean:
+            return j
+
+    return -1
+
+
+def calculate_timings(all_words, target_idx, is_lyrics_mode=False, answer_line=""):
+    """Вычисляет тайминги для вопроса и ответа.
+
+    is_lyrics_mode + answer_line: обрезает аудио на границе предыдущей СТРОКИ,
+    а не предыдущего слова (чтобы игроки не слышали слова из строки ответа).
+    """
     if not all_words or target_idx < 0 or target_idx >= len(all_words):
-        # Защита от пустого списка или некорректного индекса
         return (0, 0), (0, 0)
 
     target_word = all_words[target_idx]
-    cut_ms = int(target_word['start'] * 1000)
-    
+    target_start_ms = int(target_word['start'] * 1000)
+
+    # Обрезка: всегда по target_start_ms - offset.
+    # Это гарантирует что аудио заканчивается прямо перед словом-ответом,
+    # даже если Whisper/alignment пропустил слова между prev_word и target.
+    CUT_OFFSET_MS = 200  # 200мс до начала слова-ответа
+    cut_ms = max(0, target_start_ms - CUT_OFFSET_MS)
+
     # --- НАСТРОЙКИ ДЛИТЕЛЬНОСТИ ---
     TARGET_DURATION = 28000  # Целимся в 28 секунд
     MIN_DURATION = 25000     # Жесткий минимум 25 секунд
     # ------------------------------
 
     raw_start_ms = cut_ms - TARGET_DURATION
-    if raw_start_ms < 0: 
+    if raw_start_ms < 0:
         raw_start_ms = 0
-    
+
     q_start_ms = raw_start_ms
-    
+
     # Логика "умного" старта: ищем начало слова, которое близко к raw_start_ms,
     # но при этом не делает фрагмент короче MIN_DURATION.
     best_diff = float('inf')
@@ -1277,7 +2212,7 @@ def calculate_timings(all_words, target_idx):
             # Берем старт слова минус небольшой отступ (100мс), чтобы не глотать начало
             q_start_ms = max(0, w_ms - 100)
 
-    q_end_ms = max(0, cut_ms - 150) # Конец чуть перед словом
+    q_end_ms = cut_ms
     
     # Финальная проверка: если вдруг фрагмент получился подозрительно коротким
     # (например, из-за сбоя логики или очень раннего слова), форсируем длину.
@@ -1286,13 +2221,19 @@ def calculate_timings(all_words, target_idx):
         q_start_ms = max(0, cut_ms - 26000)
         
     # Настройки для ОТВЕТА: 5 сек до ответа + 10-15 сек после (чтобы был слышен ответ)
-    a_start_ms = max(0, cut_ms - 5000)  # 5 секунд до слова-ответа
+    a_start_ms = max(0, target_start_ms - 5000)  # 5 секунд до слова-ответа
     a_duration_ms = 15000  # 15 секунд всего (5 сек до + 10 сек после ответа)
     a_end_ms = min(int(all_words[-1]['end']*1000) + 1000, a_start_ms + a_duration_ms)
     
     return (q_start_ms, q_end_ms), (a_start_ms, a_end_ms)
 
-def build_context_string(all_words, target_idx):
+def build_context_string(all_words, target_idx, **kwargs):
+    """Контекст = слова прямо перед ответом (последняя фраза).
+
+    Если между последним Whisper-словом и ответом есть gap >0.8с,
+    значит Whisper пропустил слова — добавляем '...' чтобы показать
+    что аудио продолжается (игрок слышит больше чем видит в тексте).
+    """
     start_idx = max(0, target_idx - 12)
     current_ctx_words = []
     for i in range(target_idx - 1, start_idx - 1, -1):
@@ -1303,12 +2244,31 @@ def build_context_string(all_words, target_idx):
                 current_ctx_words.insert(0, curr_w['word'])
                 break
         current_ctx_words.insert(0, curr_w['word'])
-    
+
     if len(current_ctx_words) < 2:
         s = max(0, target_idx - 8)
         current_ctx_words = [w['word'] for w in all_words[s:target_idx]]
 
-    return " ".join(current_ctx_words) + " ___"
+    context = " ".join(current_ctx_words)
+
+    # Если у слова-ответа есть пропущенные lyrics-слова перед ним
+    # (Whisper не услышал, но они звучат в аудио) — вставляем их в контекст.
+    # Пример: Whisper дал "на этой площадке", lyrics = "на этой дэнс площадке"
+    # → skipped_before = ["дэнс"] → контекст = "на этой дэнс ___"
+    target_word = all_words[target_idx]
+    skipped = target_word.get('skipped_before', [])
+    if skipped:
+        context += " " + " ".join(skipped)
+    else:
+        # Нет данных из lyrics — проверяем gap по таймкодам
+        if target_idx > 0:
+            prev_end = all_words[target_idx - 1]['end']
+            target_start = target_word['start']
+            gap = target_start - prev_end
+            if gap > 0.8:
+                context += " ..."
+
+    return context + " ___"
 
 @app.route('/start', methods=['POST'])
 def start_gen():
