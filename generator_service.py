@@ -60,48 +60,81 @@ app = Flask(__name__)
 
 # --- СЛОВАРИ И ФИЛЬТРЫ ---
 
-JUNK_PHRASES = [
-    # Технические надписи
-    "субтитры", "подогнал", "сделал", "создавал", "dimatorzok",
-    "динамичная", "редактор", "корректор", "подпишись",
-    "симон", "продолжение", "спасибо", "просмотр", "лайк", "translated", "by",
+# --- ФИЛЬТР МУСОРА WHISPER ---
+# Мусор всегда приходит как ОТДЕЛЬНЫЙ сегмент целиком.
+# Нормализуем текст сегмента и сравниваем с эталонами.
+JUNK_SEGMENTS = {
+    # Технические надписи / титры
+    "редактор субтитров", "субтитры", "корректор",
+    "подогнал", "dimatorzok",
     # Галлюцинации Whisper (русские)
     "продолжение следует", "конец фильма", "спасибо за просмотр",
-    "подписывайтесь", "комментарий", "ставьте лайк",
-    "редактор субтитров", "добро пожаловать", "до свидания",
-    "смотрите также", "не забудьте подписаться", "ставьте лайки",
-    "следующее видео", "предыдущее видео", "нажмите колокольчик",
-    "в следующий раз", "спасибо что смотрите", "всем привет",
-    "приятного просмотра", "до новых встреч", "оставайтесь с нами",
-    # Английские артефакты и галлюцинации
-    "subtitles", "lyrics", "music", "applause", "[music]", "[applause]",
-    "thank you", "subscribe", "like and subscribe",
-    "you", "the", "and", "is", "it", "for", "this", "that",
-    "thanks for watching", "see you next time", "bye bye",
-    # Повторяющиеся артефакты
-    "ааа", "ооо", "ммм", "эээ", "ууу", "ля ля ля", "на на на",
-    "рифма", "куплеты", "припев", "песня на русском", 
-    "русском языке", "текст песни", "поэзия"
-]
+    "не забудьте подписаться", "подписывайтесь",
+    "ставьте лайки", "ставьте лайк",
+    "следующее видео", "предыдущее видео",
+    "нажмите колокольчик", "в следующий раз",
+    "спасибо что смотрите", "спасибо",
+    "приятного просмотра", "до новых встреч",
+    "оставайтесь с нами", "смотрите также",
+    "добро пожаловать", "до свидания", "всем привет",
+    # Английские
+    "like and subscribe", "thanks for watching",
+    "see you next time", "thank you for watching",
+    "thank you", "subscribe", "subtitles", "translated",
+    # Артефакты из промпта Whisper
+    "текст песни", "песня на русском", "русском языке",
+    "рифма", "куплеты", "припев", "поэзия",
+    "рифма куплеты припев",
+    "текст песни на русском языке",
+    "текст песни на русском языке рифма куплеты припев",
+    # Мычание / бессмыслица
+    "ля ля ля", "на на на",
+}
 
-def is_hallucination(segment_text):
-    """Детект галлюцинаций Whisper."""
-    if not segment_text:
+
+def _normalize_for_junk_check(text):
+    """Оставляет только буквы и пробелы, схлопывает пробелы."""
+    text = text.lower().strip()
+    text = re.sub(r'[^а-яёa-z ]', '', text)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def is_junk_segment(segment_text):
+    """
+    Проверяет, является ли ВЕСЬ сегмент мусором Whisper.
+    Мусор всегда приходит как отдельный сегмент.
+    """
+    if not segment_text or not segment_text.strip():
         return True
-    words = segment_text.split()
-    # Повторение одного слова несколько раз
+
+    norm = _normalize_for_junk_check(segment_text)
+    if not norm:
+        return True
+
+    # 1. Точное совпадение или сегмент начинается с известного мусора
+    #    (Whisper может дописать имена: "редактор субтитров асемкин корректор аегорова")
+    if norm in JUNK_SEGMENTS:
+        return True
+    for junk in JUNK_SEGMENTS:
+        if len(junk) >= 10 and norm.startswith(junk):
+            return True
+
+    # 2. Повторение одного слова (ааа ааа ааа ааа)
+    words = norm.split()
     if len(words) > 3 and len(set(words)) == 1:
         return True
-    # Слишком длинный сегмент (галлюцинация)
-    if len(segment_text) > 500:
+
+    # 3. Слишком длинный сегмент (галлюцинация-простыня)
+    if len(norm) > 500:
         return True
-    # Слишком много повторов (>90% одинаковых слов)
-    # Повышен порог с 70% до 90% для песен с повторяющимися фразами
+
+    # 4. >90% одинаковых слов
     if len(words) > 5:
         word_counts = Counter(words)
         most_common = word_counts.most_common(1)
         if most_common and most_common[0][1] / len(words) > 0.9:
             return True
+
     return False
 
 def clean_lrc_lyrics(lrc_text):
@@ -818,90 +851,77 @@ def preprocess_for_alignment(audio_path):
         return audio_path
 
 
+# --- КЭШ МОДЕЛИ РАЗДЕЛЕНИЯ ---
 _cached_separator = None
 
-def _get_separator(output_dir):
-    """Возвращает кэшированный Separator (модель загружается один раз)."""
-    global _cached_separator
-    if _cached_separator is not None:
-        # Обновляем output_dir для текущего трека
-        _cached_separator.output_dir = output_dir
-        return _cached_separator
-
-    from audio_separator.separator import Separator
-    # Заглушаем sub-логгеры audio-separator (иначе "Loading Roformer model..." на каждый вызов)
-    logging.getLogger("audio_separator").setLevel(logging.ERROR)
-    model_cache_dir = os.environ.get("MDX_MODEL_CACHE", "/app/mdx_cache")
-
-    _cached_separator = Separator(
-        log_level=logging.ERROR,
-        output_dir=output_dir,
-        output_format="wav",
-        model_file_dir=model_cache_dir,
-        output_single_stem="Vocals",
-        mdxc_params={"batch_size": 8}
-    )
-    _cached_separator.load_model(
-        model_filename='model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt'
-    )
-    return _cached_separator
-
 def release_separator():
-    """Освобождает кэшированный Separator (вызывать после генерации всех треков)."""
+    """Освобождает кэшированный Separator."""
     global _cached_separator
     if _cached_separator is not None:
         del _cached_separator
         _cached_separator = None
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        log("🗑️ Separator освобождён из памяти")
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    log("🗑️ Separator освобождён из памяти")
+
 
 def isolate_vocals(audio_path, use_cache=True):
     """
-    Изолирует вокал с помощью MDX-Net (audio-separator).
-    ОПТИМИЗИРОВАНО ДЛЯ CPU: Генерирует только стем вокала.
-    Модель Roformer кэшируется между треками.
+    Изоляция вокала с помощью Roformer (mel_band_roformer).
     """
+    global _cached_separator
     output_dir = os.path.dirname(audio_path)
     filename = os.path.basename(audio_path)
     file_id = os.path.splitext(filename)[0]
 
-    # Ожидаемый путь к файлу вокала
-    expected_vocals_path = os.path.join(output_dir, f"{file_id}_vocals.wav")
+    expected_vocals = os.path.join(output_dir, f"{file_id}_vocals.wav")
+    if use_cache and os.path.exists(expected_vocals):
+        log(f"✅ Кэш вокала: {os.path.basename(expected_vocals)}")
+        return expected_vocals
 
-    if use_cache and os.path.exists(expected_vocals_path):
-        log(f"✅ Найден кэшированный вокал (MDX): {os.path.basename(expected_vocals_path)}")
-        return expected_vocals_path
-
-    log(f"🎸 Запуск MDX-Net (CPU) для {filename}...")
+    log(f"🎸 Запуск Roformer для {filename}...")
+    t0 = time.time()
 
     try:
-        separator = _get_separator(output_dir)
+        from audio_separator.separator import Separator
+        logging.getLogger("audio_separator").setLevel(logging.ERROR)
+        model_cache_dir = os.environ.get("MDX_MODEL_CACHE", "/app/mdx_cache")
 
-        # Запуск разделения
-        output_files = separator.separate(audio_path)
+        if _cached_separator is None:
+            _cached_separator = Separator(
+                log_level=logging.ERROR,
+                output_dir=output_dir,
+                output_format="wav",
+                model_file_dir=model_cache_dir,
+                output_single_stem="Vocals",
+                mdxc_params={"batch_size": 8}
+            )
+            _cached_separator.load_model(
+                model_filename="model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt"
+            )
+        else:
+            _cached_separator.output_dir = output_dir
 
-        # Переименование результата в стандартное имя
+        output_files = _cached_separator.separate(audio_path)
+        elapsed = time.time() - t0
+
         generated_file = None
         if output_files and len(output_files) > 0:
             generated_file = os.path.join(output_dir, output_files[0])
 
         if generated_file and os.path.exists(generated_file):
-            # Удаляем старый файл если был
-            if os.path.exists(expected_vocals_path):
-                os.remove(expected_vocals_path)
-
-            os.rename(generated_file, expected_vocals_path)
-            log(f"✅ Вокал MDX извлечен: {os.path.basename(expected_vocals_path)}")
-            return expected_vocals_path
+            if os.path.exists(expected_vocals):
+                os.remove(expected_vocals)
+            os.rename(generated_file, expected_vocals)
+            log(f"✅ Вокал извлечён за {elapsed:.1f}с: {os.path.basename(expected_vocals)}")
+            return expected_vocals
         else:
-            log("⚠️ Файл вокала не был создан")
+            log("⚠️ Separator не создал файл, используем оригинал")
             return audio_path
 
     except Exception as e:
-        log(f"⚠️ Ошибка MDX-Net: {e}")
-        # Если не вышло, пробуем вернуть оригинал, чтобы процесс не упал
+        log(f"⚠️ Ошибка Roformer: {e}")
         return audio_path
 
 def _select_word_llm_flow(words, generation_stats):
@@ -1115,23 +1135,21 @@ def generation_task(game_id, token, urls):
                 has_lyrics = bool(file_data["lyrics"] and len(file_data["lyrics"]) > 50)
                 answer_line = ""  # Строка текста с ответом (для lyrics-режима)
 
-                # ===== ЕДИНЫЙ ПАЙПЛАЙН: MDX + Whisper ASR для ВСЕХ треков =====
-                # Whisper даёт точные пословные таймкоды на оригинальном аудио.
-                # Lyrics/LRC используются ТОЛЬКО для выбора слова (рифмы), НЕ для таймкодов.
+                # ===== ПАЙПЛАЙН: Roformer MDX → Whisper =====
+                track_t0 = time.time()
 
-                # 1. MDX-Net: изолируем вокал
                 vocals_path = isolate_vocals(fpath)
-
-                # 2. DSP обработка для Whisper
                 recognition_source = preprocess_for_whisper(vocals_path)
 
-                # 3. WhisperX ASR — получаем точные пословные таймкоды
                 words = process_audio_with_whisperx(
                     recognition_source,
                     device=device,
                     song_meta=file_data["meta"],
-                    official_lyrics=file_data["lyrics"]  # Lyrics в prompt улучшают точность ASR
+                    official_lyrics=file_data["lyrics"]
                 )
+
+                track_elapsed = time.time() - track_t0
+                log(f"⏱️ MDX+Whisper: {track_elapsed:.1f}с | {len(words)} слов")
 
                 if len(words) < 15:
                     log("🚫 Мало слов от Whisper. Пропуск.")
@@ -1335,7 +1353,7 @@ def forced_align_lyrics(audio_path, official_lyrics, device="cpu", raw_lrc=""):
                     clean_line = lrc_line["text"].strip()
                     if not clean_line:
                         continue
-                    if any(junk in clean_line.lower() for junk in JUNK_PHRASES):
+                    if is_junk_segment(clean_line):
                         continue
 
                     seg_start = lrc_line["time_ms"] / 1000.0
@@ -1363,7 +1381,7 @@ def forced_align_lyrics(audio_path, official_lyrics, device="cpu", raw_lrc=""):
                 clean_line = line.strip()
                 if not clean_line:
                     continue
-                if any(junk in clean_line.lower() for junk in JUNK_PHRASES):
+                if is_junk_segment(clean_line):
                     continue
 
                 seg_start = i * time_per_line
@@ -1520,6 +1538,15 @@ def process_audio_with_whisperx(audio_path, device="cpu", song_meta="", official
         
         raw_segments = result["segments"]
 
+        # Фильтруем мусорные сегменты ДО alignment (иначе alignment падает с WARNING)
+        filtered_segments = []
+        for seg in raw_segments:
+            seg_text = seg.get("text", "")
+            if is_junk_segment(seg_text):
+                log(f"🗑️ Мусор до alignment: '{seg_text}'")
+                continue
+            filtered_segments.append(seg)
+
         del model
         gc.collect()
         if device == "cuda": torch.cuda.empty_cache()
@@ -1529,11 +1556,11 @@ def process_audio_with_whisperx(audio_path, device="cpu", song_meta="", official
         metadata_a = None
         try:
             model_a, metadata_a = whisperx.load_align_model(language_code=result["language"], device=device)
-            aligned_result = whisperx.align(raw_segments, model_a, metadata_a, audio, device, return_char_alignments=False)
+            aligned_result = whisperx.align(filtered_segments, model_a, metadata_a, audio, device, return_char_alignments=False)
             segments_to_process = aligned_result["segments"]
         except Exception as e:
             log(f"⚠️ Ошибка Alignment: {e}. Используем сырые сегменты.")
-            segments_to_process = raw_segments
+            segments_to_process = filtered_segments
         finally:
             # Гарантированная очистка модели и метаданных
             if model_a is not None:
@@ -1550,9 +1577,8 @@ def process_audio_with_whisperx(audio_path, device="cpu", song_meta="", official
 
         all_words = []
         for segment in segments_to_process:
-            seg_text = segment.get("text", "").lower()
-            if any(junk in seg_text for junk in JUNK_PHRASES): continue
-            if is_hallucination(seg_text): continue
+            seg_text = segment.get("text", "")
+            if is_junk_segment(seg_text): continue
 
             words_in_seg = segment.get("words", [])
             
