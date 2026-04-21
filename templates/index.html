@@ -5,10 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>NEURO PLAYER</title>
     
+    <link href="{{ url_for('static', filename='offline-fallback.css') }}" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <script
+        src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"
+        onerror="this.onerror=null;this.src='{{ url_for('static', filename='socketio-lite.js') }}';"
+    ></script>
     
     <style>
         :root {
@@ -219,7 +223,8 @@
             <div class="text-center mb-4">
                 <span class="badge bg-primary bg-opacity-25 text-primary border border-primary px-3 py-2 rounded-pill"><span data-i18n="qNum">Question</span> #<span id="qIndex"></span></span>
             </div>
-            <h4 class="text-center mb-5 fw-bold" id="questionTextDisplay" style="min-height: 50px;"></h4>
+            <h4 class="text-center mb-5 fw-bold" id="questionTextDisplay" style="min-height: 50px; white-space: pre-line;"></h4>
+            <div id="questionTrackMetaDisplay" class="text-center text-white-50 small mb-4 hidden"></div>
             <div id="listeningMessage" class="text-center py-3">
                 <div class="mb-3">
                     <div class="spinner-grow text-primary" role="status" style="width: 3rem; height: 3rem;"></div>
@@ -229,6 +234,7 @@
             <div id="interactionContainer" class="hidden">
                 <input type="text" id="textAnswer" class="form-control form-control-custom mb-3" placeholder="...">
                 <button onclick="submitText()" class="btn btn-purple-main w-100 fw-bold" data-i18n="btnSubmit">SEND ANSWER</button>
+                <div id="answerError" class="text-danger mt-3 small fw-bold hidden"></div>
             </div>
             <div id="answerStatus" class="text-center mt-3 hidden">
                 <span class="badge bg-success px-3 py-2 rounded-pill"><i class="fas fa-check me-2"></i> <span data-i18n="answerSent">Answer Accepted</span></span>
@@ -243,6 +249,7 @@
                 
                 <h6 class="text-white-50 text-uppercase mb-2" style="letter-spacing: 1px;" data-i18n="correctLabel">Correct Answer</h6>
                 <h3 class="fw-bold mb-0" id="correctAnswerText"></h3>
+                <div id="resultTrackMetaDisplay" class="text-white-50 small mt-3 hidden"></div>
             </div>
             
             <h6 class="text-center text-accent text-uppercase mb-3" style="letter-spacing: 1px;" data-i18n="roundTable">Table</h6>
@@ -263,6 +270,17 @@
     </div>
 
     <script>
+        function showDependencyError(message) {
+            let banner = document.getElementById('dependencyErrorBanner');
+            if (!banner) {
+                banner = document.createElement('div');
+                banner.id = 'dependencyErrorBanner';
+                banner.className = 'offline-error-banner';
+                document.body.appendChild(banner);
+            }
+            banner.textContent = message;
+        }
+
         const i18n = {
             en: {
                 gameTitle: "NEURO GAME",
@@ -291,7 +309,9 @@
                 placeholderAns: "Your answer...",
                 btnNextVip: "NEXT QUESTION",
                 statusCorrect: "✅ CORRECT! +2 PTS",
-                statusWrong: "❌ WRONG"
+                statusWrong: "❌ WRONG",
+                shortAnswerError: "Min 4 characters",
+                whisperMetaLabel: "Whisper Track"
             },
             ru: {
                 gameTitle: "НЕЙРО ИГРА",
@@ -320,7 +340,9 @@
                 placeholderAns: "Ваш ответ...",
                 btnNextVip: "СЛЕДУЮЩИЙ ВОПРОС",
                 statusCorrect: "✅ ВЕРНО! +2 БАЛЛА",
-                statusWrong: "❌ НЕВЕРНО"
+                statusWrong: "❌ НЕВЕРНО",
+                shortAnswerError: "Минимум 4 символа",
+                whisperMetaLabel: "Whisper-трек"
             }
         };
 
@@ -343,7 +365,37 @@
             document.getElementById('textAnswer').placeholder = t('placeholderAns');
         }
 
+        function normalizeAnswerForValidation(text) {
+            return (text || '')
+                .toLowerCase()
+                .replace(/ё/g, 'е')
+                .replace(/[^\wа-яё]/gi, '');
+        }
+
+        function setAnswerError(message) {
+            const errorEl = document.getElementById('answerError');
+            errorEl.innerText = message || '';
+            errorEl.classList.toggle('hidden', !message);
+        }
+
+        function renderTrackMeta(trackMeta) {
+            const text = trackMeta ? `${t('whisperMetaLabel')}: ${trackMeta}` : '';
+            const questionMetaEl = document.getElementById('questionTrackMetaDisplay');
+            const resultMetaEl = document.getElementById('resultTrackMetaDisplay');
+
+            questionMetaEl.innerText = text;
+            questionMetaEl.classList.toggle('hidden', !text);
+
+            resultMetaEl.innerText = text;
+            resultMetaEl.classList.toggle('hidden', !text);
+        }
+
         document.addEventListener("DOMContentLoaded", () => {
+            if (typeof io !== 'function') {
+                showDependencyError('Local realtime client did not load. Verify that /static/socketio-lite.js is reachable through nginx on port 5002.');
+                return;
+            }
+
             // Настройка WebSocket с автоматическим переподключением
             const socket = io({
                 reconnection: true,
@@ -412,6 +464,7 @@
                     if (d.question_data) {
                         document.getElementById('qIndex').innerText = d.question_data.index;
                         document.getElementById('questionTextDisplay').innerText = d.question_data.question || '';
+                        renderTrackMeta(d.question_data.track_meta || '');
                     }
                     showScreen('questionBlock');
                     if (d.inputs_enabled) {
@@ -433,8 +486,10 @@
                 document.getElementById('timerOverlay').style.display = 'none';
                 document.getElementById('qIndex').innerText = d.index;
                 document.getElementById('questionTextDisplay').innerText = d.question || "";
+                renderTrackMeta(d.track_meta || '');
                 
                 document.getElementById('answerStatus').classList.add('hidden');
+                setAnswerError('');
                 document.getElementById('listeningMessage').classList.remove('hidden');
                 document.getElementById('interactionContainer').classList.add('hidden');
                 document.getElementById('textAnswer').value = '';
@@ -448,6 +503,7 @@
             socket.on('allow_answers', () => {
                 document.getElementById('listeningMessage').classList.add('hidden');
                 document.getElementById('interactionContainer').classList.remove('hidden');
+                setAnswerError('');
             });
 
             socket.on('start_timer', (d) => {
@@ -463,6 +519,7 @@
                 document.getElementById('timerOverlay').style.display = 'none';
                 showScreen('resultBlock');
                 document.getElementById('correctAnswerText').innerText = d.answer;
+                renderTrackMeta(d.track_meta || '');
 
                 // Используем my_delta вместо deltas[myName] для надежности
                 const card = document.getElementById('resultCardHeader');
@@ -500,6 +557,13 @@
                 }
             });
 
+            socket.on('answer_validation_error', (d) => {
+                setAnswerError(d.msg || t('shortAnswerError'));
+                document.getElementById('textAnswer').disabled = false;
+                document.getElementById('interactionContainer').classList.remove('hidden');
+                document.getElementById('answerStatus').classList.add('hidden');
+            });
+
             window.requestNextQuestion = function() {
                 socket.emit('player_next_question');
                 document.getElementById('vipNextBtn').classList.add('hidden'); 
@@ -523,6 +587,14 @@
 
             window.submitText = function() {
                 const val = document.getElementById('textAnswer').value;
+                if (!val) {
+                    return;
+                }
+                if (normalizeAnswerForValidation(val).length < 4) {
+                    setAnswerError(t('shortAnswerError'));
+                    return;
+                }
+                setAnswerError('');
                 if(val) {
                     socket.emit('submit_answer', {answer: val});
                     document.getElementById('textAnswer').disabled = true;

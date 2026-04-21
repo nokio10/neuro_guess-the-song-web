@@ -4,8 +4,9 @@ services:
     build: .
     container_name: music-quiz-game
     restart: always
-    # ИСПРАВЛЕНИЕ: Запускаем через Gunicorn + Eventlet для стабильности
-    command: gunicorn -k eventlet -w 1 --bind 0.0.0.0:5000 --timeout 120 --access-logfile - --error-logfile - game_app:app
+    # Один процесс и общий in-memory state игры, но без deprecated eventlet.
+    # Для Socket.IO держим высокий запас потоков, потому что соединения долгоживущие.
+    command: gunicorn --worker-class gthread --threads 100 --workers 1 --bind 0.0.0.0:5000 --timeout 120 game_app:app
     # Порты можно не пробрасывать наружу (5002), если есть Nginx на 80 порту.
     # Но для отладки можно оставить.
     expose:
@@ -28,14 +29,16 @@ services:
     ports:
       - "5001:5001"
     environment:
-      # Убедитесь, что IP правильный и доступен из контейнера
-      - OLLAMA_HOST=http://192.168.1.142:11434
+      - ENABLE_EXPERIMENTAL_LINE_REMAP=${ENABLE_EXPERIMENTAL_LINE_REMAP:-0}
       - WHISPER_DEVICE=cpu
       - WHISPER_COMPUTE_TYPE=int8
+      - WHISPER_THREADS=8
+      - WHISPER_BATCH_SIZE=8
+      - MDX_BATCH_SIZE=1
       - HF_HOME=/app/whisper_cache
       - TORCH_HOME=/app/whisper_cache
       # Токен нужен только если модель WhisperX требует авторизации (обычно нет для large-v3)
-      - HF_TOKEN=hf
+      - HF_TOKEN=
       - OMP_NUM_THREADS=8
       - MKL_NUM_THREADS=8
     volumes:

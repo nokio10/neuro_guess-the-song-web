@@ -1,27 +1,22 @@
-import eventlet
-eventlet.monkey_patch() # ОБЯЗАТЕЛЬНО ПЕРВАЯ СТРОКА
-
 import os
 import json
-import uuid
 import random
 import string
 import shutil
 import requests
-import re 
+import re
 import glob
-from functools import wraps
-from flask import Flask, render_template, request, Response
+from flask import Flask, render_template, request
 from flask_socketio import SocketIO, emit, join_room
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'production_secret_key_change_me'
 
-# ИСПОЛЬЗУЕМ EVENTLET с улучшенными настройками для стабильности
+# Используем threading + gunicorn gthread/simple-websocket вместо eventlet.
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode='eventlet',
+    async_mode='threading',
     ping_timeout=60,  # Увеличиваем timeout для медленных соединений
     ping_interval=25,  # Частота ping для проверки соединения
     logger=True,
@@ -32,6 +27,7 @@ socketio = SocketIO(
 BASE_DIR = os.getcwd()
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 GENERATOR_URL = os.environ.get("GENERATOR_URL", "http://generator:5001")
+MIN_PLAYER_ANSWER_LENGTH = 4
 
 if not os.path.exists(MEDIA_ROOT): os.makedirs(MEDIA_ROOT)
 
@@ -41,6 +37,13 @@ def normalize_answer_strict(text):
     return re.sub(r'[^\w]', '', text)
 
 # --- СОСТОЯНИЕ ИГРЫ ---
+def validate_player_answer_text(text):
+    normalized = normalize_answer_strict(text)
+    if len(normalized) < MIN_PLAYER_ANSWER_LENGTH:
+        return False, f'Ответ должен содержать минимум {MIN_PLAYER_ANSWER_LENGTH} символа(ов).'
+    return True, ""
+
+
 class GameState:
     def __init__(self):
         self.game_id = None
@@ -115,7 +118,8 @@ def on_join(data):
             'index': game.current_q_index + 1,
             'total': len(game.questions),
             'question': current_q.get('question', ''),
-            'type': current_q.get('type', 'text')
+            'type': current_q.get('type', 'text'),
+            'track_meta': current_q.get('track_meta', ''),
         }, to=request.sid)
 
     # Если идет фаза ответов и у игрока нет ответа - разрешаем отвечать
@@ -219,7 +223,8 @@ def admin_next():
         socketio.emit('new_question', {
             'type': 'text', 
             'question': q['question'], 
-            'index': game.current_q_index + 1
+            'index': game.current_q_index + 1,
+            'track_meta': q.get('track_meta', ''),
         }, to='players')
         
         # ВАЖНО: Отправляем в admin_room, чтобы играло у админа, даже если нажал игрок
@@ -250,7 +255,15 @@ def admin_audio_finished():
 @socketio.on('submit_answer')
 def on_answer(data):
     if game.current_phase == 'question' and game.inputs_enabled:
-        game.players[request.sid]['last_answer'] = data.get('answer')
+        answer_text = (data.get('answer') or '').strip()
+        is_valid, message = validate_player_answer_text(answer_text)
+        if not is_valid:
+            emit('answer_validation_error', {
+                'msg': message,
+                'min_length': MIN_PLAYER_ANSWER_LENGTH,
+            }, to=request.sid)
+            return
+        game.players[request.sid]['last_answer'] = answer_text
         _broadcast_admin_info()
         if len(game.players) > 0 and all(p['last_answer'] for p in game.players.values()):
             game.inputs_enabled = False
@@ -302,6 +315,7 @@ def _reveal():
     for sid, p in game.players.items():
         socketio.emit('show_answer_client', {
             'answer': q['answer'],
+            'track_meta': q.get('track_meta', ''),
             'deltas': deltas,
             'leaderboard': lb,
             'vip_id': vip_sid,
@@ -357,7 +371,6 @@ def admin_remove_player(data):
     """Удаление игрока администратором"""
     pid = data.get('id')
     if pid in game.players:
-        player_name = game.players[pid]['name']
         del game.players[pid]
         # Отправляем игроку сообщение о сбросе (выкинет его из игры)
         socketio.emit('game_reset', to=pid)
@@ -451,7 +464,11 @@ def _get_client_state():
     return {
         'state': game.current_phase, 
         'inputs_enabled': game.inputs_enabled, 
-        'question_data': {'question': q['question'], 'index': game.current_q_index+1} if q else None
+        'question_data': {
+            'question': q['question'],
+            'index': game.current_q_index + 1,
+            'track_meta': q.get('track_meta', ''),
+        } if q else None
     }
 
 def _broadcast_admin_info():
@@ -485,4 +502,11 @@ def on_disconnect():
     pass
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
+    socketio.run(
+        app,
+        host='0.0.0.0',
+        port=5000,
+        debug=False,
+        use_reloader=False,
+        allow_unsafe_werkzeug=True,
+    )
